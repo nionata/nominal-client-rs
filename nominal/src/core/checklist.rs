@@ -391,23 +391,15 @@ impl CheckStatus {
     }
 }
 
-/// Server error name returned by `checklist_live_status` when nothing is attached for the
-/// given (checklist, asset) pair.
-const STREAMING_CHECKLIST_NOT_FOUND: &str = "ChecklistExecution:StreamingChecklistNotFoundForAsset";
-
-fn is_streaming_checklist_not_found(err: &conjure_error::Error) -> bool {
-    err.cause()
-        .downcast_ref::<conjure_runtime::errors::RemoteError>()
-        .and_then(|remote| remote.error())
-        .map(|se| se.error_name() == STREAMING_CHECKLIST_NOT_FOUND)
-        .unwrap_or(false)
-}
-
-fn duration_to_api(d: Duration) -> ApiDuration {
-    ApiDuration::builder()
-        .seconds(SafeLong::new(d.as_secs() as i64).unwrap_or_else(|_| SafeLong::new(0).unwrap()))
-        .nanos(SafeLong::new(d.subsec_nanos() as i64).unwrap_or_else(|_| SafeLong::new(0).unwrap()))
-        .build()
+fn duration_to_api(d: Duration) -> Result<ApiDuration> {
+    let out_of_range = || Error::DurationOutOfRange {
+        seconds: d.as_secs(),
+        nanos: d.subsec_nanos(),
+    };
+    let secs = i64::try_from(d.as_secs()).map_err(|_| out_of_range())?;
+    let seconds = SafeLong::new(secs).map_err(|_| out_of_range())?;
+    let nanos = SafeLong::new(d.subsec_nanos() as i64).map_err(|_| out_of_range())?;
+    Ok(ApiDuration::builder().seconds(seconds).nanos(nanos).build())
 }
 
 /// Client for checklist collection operations (get, search) and streaming attachment.
@@ -530,30 +522,30 @@ impl ChecklistsClient {
     ///
     /// When the streaming checklist is running, the returned status carries the commit ID
     /// the evaluator currently has loaded, which may differ from the latest commit on the
-    /// main branch. Returns `None` if the checklist is not attached to the asset.
+    /// main branch. Errors with `ChecklistExecution:StreamingChecklistNotFoundForAsset`
+    /// if no streaming checklist is attached to the asset.
     pub async fn live_status(
         &self,
         checklist_rid: &str,
         asset_rid: &str,
-    ) -> Result<Option<ChecklistLiveStatus>> {
+    ) -> Result<ChecklistLiveStatus> {
         let checklist_rid = parse_rid::<ChecklistRid>(checklist_rid)?;
         let asset_rid = parse_rid::<AssetRid>(asset_rid)?;
         let request = BatchChecklistLiveStatusRequest::builder()
             .requests([ChecklistLiveStatusRequest::new(checklist_rid, asset_rid)])
             .build();
-        let response = match self
+        let response = self
             .execution_service
             .checklist_live_status(&self.token, &request)
             .await
-        {
-            Ok(r) => r,
-            Err(e) if is_streaming_checklist_not_found(&e) => return Ok(None),
-            Err(e) => return Err(Error::from(e)),
-        };
-        Ok(response
+            .map_err(Error::from)?;
+        response
             .checklist_live_status_responses()
             .first()
-            .map(|r| ChecklistLiveStatus::from_conjure(r.status())))
+            .map(|r| ChecklistLiveStatus::from_conjure(r.status()))
+            .ok_or_else(|| Error::UnexpectedResponse {
+                field: "checklistLiveStatusResponses",
+            })
     }
 
     /// Attach a streaming checklist to a set of assets.
@@ -577,9 +569,9 @@ impl ChecklistsClient {
             .collect::<Result<BTreeSet<_>>>()?;
 
         let evaluation_delay =
-            duration_to_api(options.evaluation_delay.unwrap_or(Duration::from_secs(0)));
+            duration_to_api(options.evaluation_delay.unwrap_or(Duration::from_secs(0)))?;
         let recovery_delay =
-            duration_to_api(options.recovery_delay.unwrap_or(Duration::from_secs(15)));
+            duration_to_api(options.recovery_delay.unwrap_or(Duration::from_secs(15)))?;
 
         let notification_configurations = options
             .integration_rids
@@ -741,8 +733,16 @@ mod tests {
     #[test]
     fn duration_conversion() {
         let d = Duration::new(42, 123);
-        let api = duration_to_api(d);
+        let api = duration_to_api(d).unwrap();
         assert_eq!(api.seconds(), SafeLong::new(42).unwrap());
         assert_eq!(api.nanos(), SafeLong::new(123).unwrap());
+    }
+
+    #[test]
+    fn duration_out_of_range_seconds_errors() {
+        // SafeLong upper bound is 2^53 - 1; any value above that must fail.
+        let d = Duration::from_secs(u64::MAX);
+        let err = duration_to_api(d).unwrap_err();
+        assert!(matches!(err, Error::DurationOutOfRange { .. }));
     }
 }
